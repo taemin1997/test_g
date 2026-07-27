@@ -63,7 +63,7 @@ manufacturers_seed = [
     {
         "manufacturer_name": "폭스바겐",
         "country": "독일",
-        "official_url": "https://www.vw.co.kr/",
+        "official_url": "https://www.volkswagen.co.kr/ko.html",
         "logo_url": None,
     },
     {

@@ -12,8 +12,12 @@ from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+import pandas as pd
+import pymysql
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 import streamlit as st
+
+from db_config import ensure_schema, get_db_connection
 
 # 브라우저 탭에 표시되는 제목, 아이콘, 화면 폭을 설정합니다.
 #
@@ -23,8 +27,41 @@ import streamlit as st
 st.set_page_config(
     page_title="성향 검사",
     page_icon="📝",
-    layout="centered",
+    layout="wide",
 )
+
+
+# ------------------------------------------------------------
+# DB 연결 헬퍼
+#   - db_config.get_db_connection()으로 pymysql 커넥션을 얻고,
+#   - 쿼리 결과를 pandas DataFrame으로 돌려줘서
+#     기존 st.connection(...).query(...) 결과(DataFrame)를 쓰던
+#     아래쪽 코드(.iloc, .columns, .empty, .to_dict("records") 등)를
+#     그대로 재사용할 수 있게 합니다.
+#   - 쿼리 문자열의 파라미터는 SQLAlchemy 스타일(:name) 대신
+#     pymysql pyformat 스타일(%(name)s)을 사용합니다.
+# ------------------------------------------------------------
+@st.cache_resource
+def _init_schema():
+    """앱이 처음 뜰 때(또는 인스턴스가 새로 뜰 때) 딱 한 번만 스키마를 보장합니다."""
+    ensure_schema()
+    return True
+
+
+_init_schema()
+
+
+def _run_query(sql, params=None):
+    """SELECT 쿼리를 실행하고 결과를 pandas DataFrame으로 반환합니다."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor(pymysql.cursors.DictCursor) as cur:
+            cur.execute(sql, params or {})
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return pd.DataFrame(rows)
+
 
 # %%
 # ============================================================
@@ -160,7 +197,7 @@ SELECT
     mbti_description,
     mbti_tags
 FROM car_mbti
-WHERE mbti_id = :mbti_id
+WHERE mbti_id = %(mbti_id)s
 """
 
 CAR_MBTI_BASE_QUERY = """
@@ -169,7 +206,7 @@ SELECT
     mbti_name,
     mbti_description
 FROM car_mbti
-WHERE mbti_id = :mbti_id
+WHERE mbti_id = %(mbti_id)s
 """
 
 CAR_RECOMMEND_QUERY = """
@@ -188,7 +225,7 @@ JOIN vehicle AS v
     ON v.vehicle_id = cr.vehicle_id
 LEFT JOIN manufacturer AS m
     ON m.manufacturer_id = v.manufacturer_id
-WHERE cr.mbti_id = :mbti_id
+WHERE cr.mbti_id = %(mbti_id)s
 ORDER BY cr.recom_car_rank
 """
 
@@ -196,8 +233,8 @@ CAR_RECOMMEND_VEHICLE_ID_QUERY = """
 SELECT
     cr.vehicle_id
 FROM car_recommend AS cr
-WHERE cr.mbti_id = :mbti_id
-  AND cr.recom_car_rank = :vehicle_rank
+WHERE cr.mbti_id = %(mbti_id)s
+  AND cr.recom_car_rank = %(vehicle_rank)s
 ORDER BY cr.recom_id DESC
 LIMIT 1
 """
@@ -350,8 +387,8 @@ SELECT
 FROM vehicle AS v
 JOIN manufacturer AS m
     ON m.manufacturer_id = v.manufacturer_id
-WHERE m.manufacturer_name = :manufacturer_name
-  AND v.vehicle_name = :vehicle_name
+WHERE m.manufacturer_name = %(manufacturer_name)s
+  AND v.vehicle_name = %(vehicle_name)s
 """
 
 VEHICLE_QUERY = """
@@ -372,7 +409,7 @@ SELECT
 FROM vehicle AS v
 JOIN manufacturer AS m
     ON m.manufacturer_id = v.manufacturer_id
-WHERE v.vehicle_id = :vehicle_id
+WHERE v.vehicle_id = %(vehicle_id)s
 """
 
 VEHICLE_DETAIL_QUERY = """
@@ -388,7 +425,7 @@ SELECT
     detail_base_price,
     detail_fuel_efficiency
 FROM vehicle_detail
-WHERE vehicle_id = :vehicle_id
+WHERE vehicle_id = %(vehicle_id)s
 ORDER BY detail_base_price, detail_id
 """
 
@@ -403,7 +440,7 @@ JOIN vehicle_option AS vo
     ON vo.detail_id = vd.detail_id
 JOIN `option` AS o
     ON o.option_id = vo.option_id
-WHERE vd.vehicle_id = :vehicle_id
+WHERE vd.vehicle_id = %(vehicle_id)s
 ORDER BY vd.detail_id, o.option_category, o.option_name
 """
 
@@ -414,7 +451,7 @@ SELECT
     sales_count,
     sales_avg_price
 FROM sales_stat
-WHERE vehicle_id = :vehicle_id
+WHERE vehicle_id = %(vehicle_id)s
 ORDER BY sales_year, sales_month
 """
 
@@ -428,7 +465,7 @@ SELECT
     news_category,
     publish_date
 FROM news
-WHERE vehicle_id = :vehicle_id
+WHERE vehicle_id = %(vehicle_id)s
 ORDER BY publish_date DESC, news_id DESC
 """
 
@@ -436,10 +473,10 @@ VEHICLE_RECOMMEND_REASON_QUERY = """
 SELECT
     recom_reason
 FROM car_recommend
-WHERE vehicle_id = :vehicle_id
-  AND (:mbti_id IS NULL OR mbti_id = :mbti_id)
+WHERE vehicle_id = %(vehicle_id)s
+  AND (%(mbti_id)s IS NULL OR mbti_id = %(mbti_id)s)
 ORDER BY
-    CASE WHEN mbti_id = :mbti_id THEN 0 ELSE 1 END,
+    CASE WHEN mbti_id = %(mbti_id)s THEN 0 ELSE 1 END,
     recom_car_rank
 LIMIT 1
 """
@@ -457,26 +494,13 @@ class VehicleDataError(RuntimeError):
 def load_result_data(mbti_id):
     """MBTI 설명·태그와 PPT 명세에 맞는 추천 차량 1~3위를 조회합니다."""
 
-    try:
-        connection = st.connection("car_mbti", type="sql")
-    except Exception as error:
-        raise MbtiDataError("DB 연결에 실패했습니다.") from error
-
     params = {"mbti_id": mbti_id}
     try:
-        mbti_rows = connection.query(
-            CAR_MBTI_QUERY,
-            params=params,
-            ttl=60,
-        )
+        mbti_rows = _run_query(CAR_MBTI_QUERY, params)
     except Exception:
         # 아직 mbti_tags 마이그레이션이 적용되지 않은 DB도 기본 정보는 조회합니다.
         try:
-            mbti_rows = connection.query(
-                CAR_MBTI_BASE_QUERY,
-                params=params,
-                ttl=60,
-            ).copy()
+            mbti_rows = _run_query(CAR_MBTI_BASE_QUERY, params).copy()
         except Exception as error:
             raise MbtiDataError(
                 "car_mbti 테이블 조회에 실패했습니다."
@@ -484,11 +508,7 @@ def load_result_data(mbti_id):
         mbti_rows["mbti_tags"] = ""
 
     try:
-        recommendation_rows = connection.query(
-            CAR_RECOMMEND_QUERY,
-            params=params,
-            ttl=60,
-        )
+        recommendation_rows = _run_query(CAR_RECOMMEND_QUERY, params)
     except Exception as error:
         raise MbtiDataError(
             "car_recommend와 차량 연결 테이블 조회에 실패했습니다."
@@ -620,14 +640,12 @@ def resolve_result_vehicle_id(mbti_id, vehicle_rank):
         raise VehicleDataError("추천 차량 순위는 1~3위여야 합니다.")
 
     try:
-        connection = st.connection("car_mbti", type="sql")
-        vehicle_rows = connection.query(
+        vehicle_rows = _run_query(
             CAR_RECOMMEND_VEHICLE_ID_QUERY,
-            params={
+            {
                 "mbti_id": mbti_id,
                 "vehicle_rank": rank,
             },
-            ttl=0,
         )
     except Exception as error:
         raise VehicleDataError(
@@ -651,39 +669,17 @@ def load_vehicle_data(vehicle_id):
 
     params = {"vehicle_id": int(vehicle_id)}
     try:
-        connection = st.connection("car_mbti", type="sql")
-        vehicle_rows = connection.query(
-            VEHICLE_QUERY,
-            params=params,
-            ttl=60,
-        )
-        detail_rows = connection.query(
-            VEHICLE_DETAIL_QUERY,
-            params=params,
-            ttl=60,
-        )
-        option_rows = connection.query(
-            VEHICLE_OPTION_QUERY,
-            params=params,
-            ttl=60,
-        )
-        sales_rows = connection.query(
-            VEHICLE_SALES_QUERY,
-            params=params,
-            ttl=60,
-        )
-        news_rows = connection.query(
-            VEHICLE_NEWS_QUERY,
-            params=params,
-            ttl=60,
-        )
-        recommendation_rows = connection.query(
+        vehicle_rows = _run_query(VEHICLE_QUERY, params)
+        detail_rows = _run_query(VEHICLE_DETAIL_QUERY, params)
+        option_rows = _run_query(VEHICLE_OPTION_QUERY, params)
+        sales_rows = _run_query(VEHICLE_SALES_QUERY, params)
+        news_rows = _run_query(VEHICLE_NEWS_QUERY, params)
+        recommendation_rows = _run_query(
             VEHICLE_RECOMMEND_REASON_QUERY,
-            params={
+            {
                 "vehicle_id": int(vehicle_id),
                 "mbti_id": st.session_state.get("user_mbti") or None,
             },
-            ttl=60,
         )
     except Exception as error:
         raise VehicleDataError(
@@ -1674,8 +1670,64 @@ def return_to_result_page():
     change_page("result")
 
 
+VEHICLE_DETAIL_STYLE = """
+<style>
+.carbti-detail-image {
+  display: block;
+  width: 100%;
+  max-width: 420px;
+  height: 290px;
+  margin: 0 auto 1rem;
+  object-fit: contain;
+}
+.carbti-news-list {
+  margin-top: .25rem;
+  border-top: 1px solid #d9dde5;
+}
+.carbti-news-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: .75rem;
+  min-height: 3rem;
+  padding: .65rem .1rem;
+  border-bottom: 1px solid #d9dde5;
+}
+.carbti-news-title {
+  overflow: hidden;
+  color: #20242c;
+  font-size: .95rem;
+  font-weight: 650;
+  line-height: 1.4;
+  text-decoration: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.carbti-news-title:hover {
+  color: #1769aa;
+  text-decoration: underline;
+}
+.carbti-news-date {
+  color: #7a808c;
+  font-size: .82rem;
+  white-space: nowrap;
+}
+@media (max-width: 640px) {
+  .carbti-detail-image {
+    max-width: 330px;
+    height: 230px;
+  }
+  .carbti-news-row {
+    grid-template-columns: 1fr;
+    gap: .15rem;
+  }
+}
+</style>
+"""
+
+
 def render_vehicle_detail_page():
-    """선택한 차량의 핵심 정보와 관련 카드뉴스를 표시합니다."""
+    """차량 이미지·상세 정보·관련 뉴스 3줄을 2단으로 표시합니다."""
 
     vehicle_id = st.session_state.selected_vehicle_id
     if not vehicle_id:
@@ -1759,18 +1811,22 @@ def render_vehicle_detail_page():
         "recom_reason",
     )
 
-    st.caption(f"vehicle_id · {vehicle['vehicle_id']}")
+    st.html(VEHICLE_DETAIL_STYLE)
     st.title(display_text(vehicle["vehicle_name"], "차량 정보"))
 
-    image_column, info_column = st.columns([0.9, 1.3], gap="large")
+    image_column, info_column = st.columns([0.95, 1.25], gap="large")
 
     with image_column:
         st.markdown(
             f"#### {display_text(vehicle['vehicle_name'], '차량 이미지')}"
         )
-        st.image(
-            vehicle["car_img"] or TEST_IMAGE_DATA_URI,
-            width="stretch",
+        detail_image_url = str(
+            vehicle["car_img"] or TEST_IMAGE_DATA_URI
+        )
+        st.html(
+            '<img class="carbti-detail-image" '
+            f'src="{html.escape(detail_image_url, quote=True)}" '
+            f'alt="{html.escape(display_text(vehicle["vehicle_name"]))} 이미지">'
         )
 
         purchase_columns = st.columns(2)
@@ -1803,12 +1859,19 @@ def render_vehicle_detail_page():
                     width="stretch",
                 )
 
+        if st.button(
+            "결과 페이지",
+            icon=":material/arrow_back:",
+            width="stretch",
+        ):
+            return_to_result_page()
+
     with info_column:
         with st.container(border=True):
             st.subheader("차량 정보")
             primary, specification, maker = st.columns(
-                [1.35, 0.9, 0.8],
-                gap="medium",
+                [1.15, 0.9, 0.8],
+                gap="small",
             )
 
             with primary:
@@ -1822,8 +1885,6 @@ def render_vehicle_detail_page():
                 st.write(display_text(vehicle["vec_purpose"]))
                 st.caption("평균 가격")
                 st.write(average_price_text)
-                st.caption("추천 이유")
-                st.write(display_text(recommendation_reason))
 
             with specification:
                 st.caption("차종")
@@ -1835,47 +1896,64 @@ def render_vehicle_detail_page():
                 st.caption("제조사")
                 st.write(display_text(vehicle["manufacturer_name"]))
 
-    st.subheader("관련 카드뉴스")
-    if news.empty:
+            st.divider()
+            st.caption("추천 이유")
+            st.write(display_text(recommendation_reason))
+
         with st.container(border=True):
-            st.caption("이 차량에 등록된 카드뉴스가 없습니다.")
-    else:
-        visible_news = news.head(3)
-        news_columns = st.columns(len(visible_news), gap="medium")
-        for news_column, (_, article) in zip(
-            news_columns,
-            visible_news.iterrows(),
-        ):
-            with news_column:
-                with st.container(border=True):
-                    if has_display_value(article["news_img"]):
-                        st.image(article["news_img"], width="stretch")
-                    st.markdown(
-                        f"#### {display_text(article['title'], '차량 소식')}"
+            st.subheader("관련 뉴스")
+            if news.empty:
+                st.caption("이 차량에 등록된 뉴스가 없습니다.")
+            else:
+                news_rows = []
+                for index, (_, article) in enumerate(
+                    news.head(3).iterrows(),
+                    start=1,
+                ):
+                    title = display_text(article["title"], "차량 소식")
+                    news_url = (
+                        str(article["news_url"])
+                        if has_display_value(article["news_url"])
+                        else ""
                     )
-                    news_meta = " · ".join(
-                        str(item)
-                        for item in (
-                            article["news_category"],
-                            article["publish_date"],
+                    publish_date = article["publish_date"]
+                    if has_display_value(publish_date):
+                        try:
+                            publish_date_text = publish_date.strftime(
+                                "%Y-%m-%d"
+                            )
+                        except (AttributeError, ValueError):
+                            publish_date_text = str(publish_date)
+                    else:
+                        publish_date_text = "게시일 정보 없음"
+
+                    numbered_title = f"{index}. {title}"
+                    if news_url:
+                        title_html = (
+                            '<a class="carbti-news-title" '
+                            f'href="{html.escape(news_url, quote=True)}" '
+                            f'target="_blank" rel="noopener noreferrer">'
+                            f'{html.escape(numbered_title)}</a>'
                         )
-                        if has_display_value(item)
-                    )
-                    if news_meta:
-                        st.caption(news_meta)
-                    if has_display_value(article["summary"]):
-                        st.write(article["summary"])
-                    if has_display_value(article["news_url"]):
-                        st.link_button(
-                            "카드뉴스 보기",
-                            article["news_url"],
-                            icon=":material/open_in_new:",
-                            width="stretch",
+                    else:
+                        title_html = (
+                            '<span class="carbti-news-title">'
+                            f'{html.escape(numbered_title)}</span>'
                         )
 
-    if st.button("결과 페이지", icon=":material/arrow_back:"):
-        return_to_result_page()
+                    news_rows.append(
+                        '<div class="carbti-news-row">'
+                        f'{title_html}'
+                        '<span class="carbti-news-date">'
+                        f'{html.escape(publish_date_text)}</span>'
+                        '</div>'
+                    )
 
+                st.html(
+                    '<div class="carbti-news-list">'
+                    + "".join(news_rows)
+                    + "</div>"
+                )
 
 
 
