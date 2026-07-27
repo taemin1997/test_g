@@ -139,3 +139,8 @@ def ensure_schema():
     conn.close()
 
     _schema_ready = True
+
+if __name__ == "__main__":
+    ensure_schema()
+    print("스키마 생성 완료")
+    
