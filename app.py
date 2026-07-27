@@ -17,7 +17,7 @@ import pymysql
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 import streamlit as st
 
-from db_config import ensure_schema, get_db_connection
+from crawling.db_config import ensure_schema, get_db_connection
 
 # 브라우저 탭에 표시되는 제목, 아이콘, 화면 폭을 설정합니다.
 #
