@@ -2,7 +2,6 @@
 name = "mini-project1t"
 version = "0.1.0"
 description = "Add your description here"
-package-mode = false
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -17,3 +16,6 @@ dependencies = [
     "selenium>=4.46.0",
     "streamlit>=1.60.0",
 ]
+
+[tool.poetry]
+package-mode = false
